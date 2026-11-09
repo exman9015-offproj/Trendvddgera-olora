@@ -9,6 +9,7 @@ import ResultsView from '../components/ResultsView';
 import AuctionView from '../components/AuctionView';
 import { FeedView } from '../components/FeedView';
 import { ProfileView } from '../components/ProfileView';
+import QwenView from '../components/QwenView';
 import BidModal from '../components/BidModal';
 import AddTraitModal from '../components/AddTraitModal';
 import { supabase } from '../lib/supabase';
@@ -539,6 +540,10 @@ export default function HomePage() {
                 liveViewers={liveViewers}
                 postsCreated={postsCreated}
               />
+            )}
+
+            {currentTab === 'qwen' && (
+              <QwenView />
             )}
 
             {currentTab === 'feed' && (

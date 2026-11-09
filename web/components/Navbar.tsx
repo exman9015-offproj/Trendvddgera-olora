@@ -1,9 +1,9 @@
 'use client';
 
 import React from 'react';
-import { Home, Flame, Plus, Gavel, User } from 'lucide-react';
+import { Home, Flame, Plus, Gavel, User, Sparkles } from 'lucide-react';
 
-export type TabType = 'home' | 'feed' | 'create' | 'auctions' | 'profile';
+export type TabType = 'home' | 'feed' | 'create' | 'auctions' | 'qwen' | 'profile';
 
 interface NavItem {
   id: TabType;
@@ -22,6 +22,7 @@ export default function Navbar({ currentTab, onSelectTab }: NavbarProps) {
     { id: 'home', label: 'Início', icon: Home },
     { id: 'feed', label: 'Feed', icon: Flame },
     { id: 'create', label: 'Criar', icon: Plus, prominent: true },
+    { id: 'qwen', label: 'Qwen', icon: Sparkles },
     { id: 'auctions', label: 'Leilões', icon: Gavel },
     { id: 'profile', label: 'Perfil', icon: User },
   ];
