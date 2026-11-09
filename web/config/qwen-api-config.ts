@@ -37,4 +37,13 @@ export const QWEN_IMAGE_SIZES = [
   { width: 1024, height: 1024, label: '1:1 (1024×1024)' },
 ] as const;
 
+// Ids are the only LoRA value sent to the pod; it maps them to repos/files.
+export const QWEN_LORA_OPTIONS = [
+  { id: 'none', label: 'Sem LoRA (modelo base)' },
+  { id: 'chatrlabs', label: 'ChatR Labs Omni LoRA v0.1' },
+  { id: 'f23gg', label: 'f23gg NSFW LoRA' },
+] as const;
+
+export type QwenLoraId = (typeof QWEN_LORA_OPTIONS)[number]['id'];
+
 export const QWEN_STEP_RANGE = { min: 20, max: 100, default: 50 } as const;

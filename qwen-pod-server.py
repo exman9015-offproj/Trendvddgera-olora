@@ -2,7 +2,7 @@
 """
 Qwen Image 2.1 FastAPI Server for Runpod
 
-Loads Qwen-Image-2.1 (optional LoRA) and exposes:
+Loads Qwen-Image-2.1 and exposes (LoRA chosen per request from a fixed list):
   POST /api/generate - Text-to-image generation
   POST /api/edit     - Image editing with instruction
   GET  /health       - Health check
@@ -13,7 +13,6 @@ Usage:
 Environment variables:
   PORT (default 5000)
   QWEN_IMAGE_MODEL (default "Qwen/Qwen-Image-2.1")
-  QWEN_LORA_REPO / QWEN_LORA_WEIGHT (optional, no LoRA loaded when empty)
   QWEN_CPU_OFFLOAD (default "1", set "0" to keep the whole pipeline on GPU)
 """
 
@@ -24,7 +23,8 @@ import base64
 import random
 import logging
 import traceback
-from typing import Optional
+import threading
+from typing import Dict, Optional
 from contextlib import asynccontextmanager
 
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
@@ -51,10 +51,29 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 PORT = int(os.environ.get("PORT", "5000"))
 MODEL_ID = os.environ.get("QWEN_IMAGE_MODEL", "Qwen/Qwen-Image-2.1")
-LORA_REPO = os.environ.get("QWEN_LORA_REPO", "")
-LORA_WEIGHT = os.environ.get("QWEN_LORA_WEIGHT", "")
 CPU_OFFLOAD = os.environ.get("QWEN_CPU_OFFLOAD", "1") == "1"
-lora_loaded = False
+
+# Fixed allow-list: clients send only the id, never a repo or file name.
+LORA_OPTIONS = {
+    "chatrlabs": {
+        "repo": "chatrlabs/Qwen-Image-2.1-Uncensored-Omni-LoRA-v0.1",
+        "weight": "chatrlabs-omni-lora-v0.1-bf16.safetensors",
+    },
+    "f23gg": {
+        "repo": "f23gg/NSFW-LORA-Qwen-Image-2.1",
+        "weight": "NSFW Qwen Lora.safetensors",
+    },
+}
+LORA_NONE = "none"
+
+# "loaded" | "error: <msg>" per adapter id; absent = not tried yet.
+adapter_status: Dict[str, str] = {}
+active_lora: str = LORA_NONE
+# The pipeline and its adapter state are shared, so one request at a time.
+pipe_lock = threading.Lock()
+
+class LoraError(Exception):
+    pass
 
 SIZE_PRESETS = {
     "512x512": (512, 512),
@@ -73,18 +92,14 @@ SIZE_PRESETS = {
 pipe = None
 
 def load_pipeline():
-    """Load Qwen Image 2.1 pipeline with uncensored LoRA."""
-    global pipe, lora_loaded
+    """Load the Qwen Image 2.1 base pipeline (LoRAs load lazily on first use)."""
+    global pipe
     logger.info(f"Loading {MODEL_ID}...")
     try:
         pipe = QwenImage21Pipeline.from_pretrained(
             MODEL_ID, 
             torch_dtype=torch.bfloat16
         )
-        if LORA_REPO and LORA_WEIGHT:
-            logger.info(f"Loading LoRA from {LORA_REPO}/{LORA_WEIGHT}...")
-            pipe.load_lora_weights(LORA_REPO, weight_name=LORA_WEIGHT, adapter_name="default")
-            lora_loaded = True
         if CPU_OFFLOAD:
             pipe.enable_model_cpu_offload()
         else:
@@ -141,6 +156,7 @@ class GenerateRequest(BaseModel):
     seed: Optional[int] = None
     randomize_seed: bool = True
     lora_scale: float = 1.0
+    lora: str = LORA_NONE
 
 class EditRequest(BaseModel):
     image: str  # base64-encoded
@@ -150,6 +166,7 @@ class EditRequest(BaseModel):
     randomize_seed: bool = True
     lora_scale: float = 1.0
     preserve_identity: bool = True
+    lora: str = LORA_NONE
 
 class ImageResponse(BaseModel):
     success: bool
@@ -167,16 +184,34 @@ def _seed(seed: Optional[int], randomize_seed: bool) -> int:
         return random.randint(0, 2**32 - 1)
     return int(seed)
 
-def _set_lora(scale: float) -> None:
-    """Set LoRA adapter weight."""
-    global pipe
-    if not lora_loaded:
+def _activate_lora(lora_id: str, scale: float) -> None:
+    """Select the adapter for this request. Caller must hold pipe_lock."""
+    global active_lora
+    if lora_id == LORA_NONE:
+        if any(v == "loaded" for v in adapter_status.values()):
+            pipe.disable_lora()
+        active_lora = LORA_NONE
         return
-    try:
-        pipe.set_adapters(["default"], adapter_weights=[float(scale)])
-    except Exception as e:
-        logger.warning(f"Failed to set LoRA scale: {e}")
 
+    spec = LORA_OPTIONS[lora_id]
+    if adapter_status.get(lora_id) != "loaded":
+        logger.info(f"Loading LoRA '{lora_id}' from {spec['repo']}/{spec['weight']}...")
+        try:
+            pipe.load_lora_weights(spec["repo"], weight_name=spec["weight"], adapter_name=lora_id)
+        except Exception as e:
+            logger.error(f"LoRA '{lora_id}' failed to load: {e}")
+            traceback.print_exc()
+            adapter_status[lora_id] = f"error: {e}"
+            raise LoraError(f"Failed to load LoRA '{lora_id}': {e}") from e
+        adapter_status[lora_id] = "loaded"
+    pipe.enable_lora()
+    pipe.set_adapters([lora_id], adapter_weights=[float(scale)])
+    active_lora = lora_id
+
+def _validate_lora(lora_id: str) -> Optional[str]:
+    if lora_id != LORA_NONE and lora_id not in LORA_OPTIONS:
+        return f"Invalid lora. Options: {', '.join([LORA_NONE, *LORA_OPTIONS])}"
+    return None
 def _image_to_base64(img: Image.Image) -> str:
     """Convert PIL Image to base64."""
     buffer = io.BytesIO()
@@ -201,12 +236,17 @@ async def health():
     return {
         "status": "ok",
         "model": MODEL_ID,
-        "lora": f"{LORA_REPO}/{LORA_WEIGHT}" if lora_loaded else None,
+        "lora": active_lora if active_lora != LORA_NONE else None,
+        "active_lora": active_lora,
+        "lora_options": {
+            k: {**v, "status": adapter_status.get(k, "not loaded")}
+            for k, v in LORA_OPTIONS.items()
+        },
         "cpu_offload": CPU_OFFLOAD
     }
 
 @app.post("/api/generate", response_model=ImageResponse)
-async def generate(req: GenerateRequest):
+def generate(req: GenerateRequest):
     """Text-to-image generation."""
     import time
     start_time = time.time()
@@ -224,22 +264,26 @@ async def generate(req: GenerateRequest):
                 error=f"Invalid size. Options: {', '.join(SIZE_PRESETS.keys())}"
             )
         
+        lora_error = _validate_lora(req.lora)
+        if lora_error:
+            return ImageResponse(success=False, error=lora_error)
+
         width, height = SIZE_PRESETS[req.size]
         seed = _seed(req.seed, req.randomize_seed)
         generator = torch.Generator("cuda").manual_seed(seed)
-        
-        _set_lora(req.lora_scale)
-        
-        logger.info(f"Generating: {req.prompt[:50]}... ({width}x{height}, steps={req.steps})")
-        
-        image = pipe(
-            prompt=req.prompt.strip(),
-            width=width,
-            height=height,
-            num_inference_steps=int(req.steps),
-            true_cfg_scale=2.0,
-            generator=generator,
-        ).images[0]
+
+        logger.info(f"Generating: {req.prompt[:50]}... ({width}x{height}, steps={req.steps}, lora={req.lora})")
+
+        with pipe_lock:
+            _activate_lora(req.lora, req.lora_scale)
+            image = pipe(
+                prompt=req.prompt.strip(),
+                width=width,
+                height=height,
+                num_inference_steps=int(req.steps),
+                true_cfg_scale=2.0,
+                generator=generator,
+            ).images[0]
         
         execution_time = time.time() - start_time
         
@@ -250,6 +294,8 @@ async def generate(req: GenerateRequest):
             execution_time=execution_time
         )
     
+    except LoraError as e:
+        return ImageResponse(success=False, error=str(e))
     except Exception as e:
         logger.error(f"Generate error: {e}")
         traceback.print_exc()
@@ -259,7 +305,7 @@ async def generate(req: GenerateRequest):
         )
 
 @app.post("/api/edit", response_model=ImageResponse)
-async def edit(req: EditRequest):
+def edit(req: EditRequest):
     """Image editing with instruction."""
     import time
     start_time = time.time()
@@ -287,28 +333,32 @@ async def edit(req: EditRequest):
                 error=f"Invalid image format: {str(e)}"
             )
         
+        lora_error = _validate_lora(req.lora)
+        if lora_error:
+            return ImageResponse(success=False, error=lora_error)
+
         seed = _seed(req.seed, req.randomize_seed)
         generator = torch.Generator("cuda").manual_seed(seed)
-        
-        _set_lora(req.lora_scale)
-        
+
         # Calculate dimensions (keep ~1K area)
         w, h = input_image.size
         scale = (1024 * 1024 / max(w * h, 1)) ** 0.5
         width = max(64, int(w * scale) // 32 * 32)
         height = max(64, int(h * scale) // 32 * 32)
         
-        logger.info(f"Editing: {req.instruction[:50]}... (output {width}x{height}, steps={req.steps})")
-        
-        output = pipe(
-            prompt=req.instruction.strip(),
-            image=input_image,
-            width=width,
-            height=height,
-            num_inference_steps=int(req.steps),
-            true_cfg_scale=2.0,
-            generator=generator,
-        ).images[0]
+        logger.info(f"Editing: {req.instruction[:50]}... (output {width}x{height}, steps={req.steps}, lora={req.lora})")
+
+        with pipe_lock:
+            _activate_lora(req.lora, req.lora_scale)
+            output = pipe(
+                prompt=req.instruction.strip(),
+                image=input_image,
+                width=width,
+                height=height,
+                num_inference_steps=int(req.steps),
+                true_cfg_scale=2.0,
+                generator=generator,
+            ).images[0]
         
         execution_time = time.time() - start_time
         
@@ -319,6 +369,8 @@ async def edit(req: EditRequest):
             execution_time=execution_time
         )
     
+    except LoraError as e:
+        return ImageResponse(success=False, error=str(e))
     except Exception as e:
         logger.error(f"Edit error: {e}")
         traceback.print_exc()

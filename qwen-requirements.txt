@@ -6,4 +6,5 @@ transformers
 safetensors
 accelerate
 sentencepiece
+peft
 git+https://github.com/huggingface/diffusers

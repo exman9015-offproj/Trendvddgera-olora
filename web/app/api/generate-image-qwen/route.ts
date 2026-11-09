@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getQwenConfig } from '../../../config/qwen-api-config';
+import { getQwenConfig, QWEN_LORA_OPTIONS, type QwenLoraId } from '../../../config/qwen-api-config';
 
 export const maxDuration = 300;
 
@@ -10,6 +10,7 @@ interface QwenGenerateRequest {
   size: string; // "512x512" or similar
   steps: number;
   guidance_scale?: number;
+  lora: QwenLoraId;
 }
 
 interface QwenEditRequest {
@@ -17,6 +18,7 @@ interface QwenEditRequest {
   instruction: string;
   steps: number;
   preserve_identity?: boolean;
+  lora: QwenLoraId;
 }
 
 interface QwenResponse {
@@ -44,6 +46,7 @@ async function generateImage(body: QwenGenerateRequest): Promise<QwenResponse> {
           size: body.size,
           steps: body.steps,
           guidance_scale: body.guidance_scale ?? 7.5,
+          lora: body.lora,
         }),
       }),
       new Promise<never>((_, reject) =>
@@ -90,6 +93,7 @@ async function editImage(body: QwenEditRequest): Promise<QwenResponse> {
           instruction: body.instruction,
           steps: body.steps,
           preserve_identity: body.preserve_identity ?? true,
+          lora: body.lora,
         }),
       }),
       new Promise<never>((_, reject) =>
@@ -136,6 +140,14 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const lora = body.lora ?? 'none';
+    if (!QWEN_LORA_OPTIONS.some((option) => option.id === lora)) {
+      return NextResponse.json(
+        { error: `Invalid lora. Use one of: ${QWEN_LORA_OPTIONS.map((o) => o.id).join(', ')}.` },
+        { status: 400 }
+      );
+    }
+
     let result: QwenResponse;
 
     if (mode === 'generate') {
@@ -145,7 +157,7 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
-      result = await generateImage(body as QwenGenerateRequest);
+      result = await generateImage({ ...body, lora } as QwenGenerateRequest);
     } else {
       if (!body.image || !body.instruction || !body.steps) {
         return NextResponse.json(
@@ -153,7 +165,7 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
-      result = await editImage(body as QwenEditRequest);
+      result = await editImage({ ...body, lora } as QwenEditRequest);
     }
 
     // Check for timeout

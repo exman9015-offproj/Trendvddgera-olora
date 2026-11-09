@@ -2,7 +2,12 @@
 
 import React, { useState } from 'react';
 import { Upload, Zap, Image as ImageIcon, ArrowRight } from 'lucide-react';
-import { QWEN_IMAGE_SIZES, QWEN_STEP_RANGE } from '../config/qwen-api-config';
+import {
+  QWEN_IMAGE_SIZES,
+  QWEN_LORA_OPTIONS,
+  QWEN_STEP_RANGE,
+  type QwenLoraId,
+} from '../config/qwen-api-config';
 
 type QwenMode = 'generate' | 'edit';
 
@@ -29,6 +34,38 @@ export default function QwenView({ onClose }: QwenViewProps) {
 
   const [executionTime, setExecutionTime] = useState<number | null>(null);
 
+  // Shared by both modes
+  const [lora, setLora] = useState<QwenLoraId>('none');
+
+  const loraSelector = (
+    <div>
+      <label
+        htmlFor={`qwen-lora-${mode}`}
+        className="block text-sm font-semibold text-gray-700 mb-2"
+      >
+        LoRA
+      </label>
+      <select
+        id={`qwen-lora-${mode}`}
+        value={lora}
+        onChange={(e) => setLora(e.target.value as QwenLoraId)}
+        className="w-full p-3 border border-gray-300 rounded-lg bg-white focus:outline-none focus:ring-2 focus:ring-[#00A86B]"
+        disabled={loading}
+      >
+        {QWEN_LORA_OPTIONS.map((option) => (
+          <option key={option.id} value={option.id}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+      {lora !== 'none' && (
+        <p className="text-xs text-gray-500 mt-1">
+          A primeira requisição com esta LoRA baixa o arquivo e pode demorar mais.
+        </p>
+      )}
+    </div>
+  );
+
   // Generate image
   const handleGenerate = async () => {
     if (!prompt.trim()) {
@@ -49,6 +86,7 @@ export default function QwenView({ onClose }: QwenViewProps) {
           prompt,
           size: selectedSize,
           steps,
+          lora,
         }),
       });
 
@@ -94,6 +132,7 @@ export default function QwenView({ onClose }: QwenViewProps) {
           instruction: editInstruction,
           steps,
           preserve_identity: preserveIdentity,
+          lora,
         }),
       });
 
@@ -217,6 +256,8 @@ export default function QwenView({ onClose }: QwenViewProps) {
               ))}
             </div>
           </div>
+
+          {loraSelector}
 
           {/* Steps Slider */}
           <div>
@@ -344,6 +385,8 @@ export default function QwenView({ onClose }: QwenViewProps) {
               Preservar identidade da pessoa
             </label>
           </div>
+
+          {loraSelector}
 
           {/* Steps Slider */}
           <div>

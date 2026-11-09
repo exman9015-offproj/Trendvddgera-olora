@@ -33,6 +33,7 @@ Para não perder o modelo a cada reinício, use um network volume montado em `/w
 
 ## Servidor
 - `QWEN_CPU_OFFLOAD` (padrão `1`): offload de CPU para caber na GPU de 24GB. Use `0` para manter tudo na GPU.
-- `QWEN_LORA_REPO` / `QWEN_LORA_WEIGHT`: o LoRA só carrega se ambos forem definidos. Nenhum LoRA está ativo.
+- LoRA: escolhida por requisição (`lora`: `none`, `chatrlabs` ou `f23gg`) na página Qwen, em Gerar e Editar. O servidor mapeia o id para repo/arquivo fixos e carrega sob demanda (precisa de `peft`; reinicie o servidor após instalar). `/health` mostra o status de cada adapter.
+- Reinício: não use `pkill -f qwen-pod-server.py` no mesmo comando ssh que contém esse texto (mata o próprio shell).
 - Endpoints: `GET /health`, `POST /api/generate`, `POST /api/edit`.
 - Os arquivos devem ter finais de linha LF (CRLF quebra o `.sh`).
