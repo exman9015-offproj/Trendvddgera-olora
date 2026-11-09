@@ -11,6 +11,8 @@ interface QwenGenerateRequest {
   steps: number;
   guidance_scale?: number;
   lora: QwenLoraId;
+  seed?: number;
+  negative_prompt?: string;
 }
 
 interface QwenEditRequest {
@@ -19,13 +21,23 @@ interface QwenEditRequest {
   steps: number;
   preserve_identity?: boolean;
   lora: QwenLoraId;
+  seed?: number;
+  negative_prompt?: string;
 }
 
 interface QwenResponse {
   success: boolean;
   image?: string; // base64
+  seed?: number;
   error?: string;
   execution_time?: number;
+}
+
+const MAX_SEED = 2 ** 32 - 1;
+const MAX_NEGATIVE_PROMPT_LENGTH = 2000;
+
+function seedFields(seed?: number): { seed?: number; randomize_seed: boolean } {
+  return seed === undefined ? { randomize_seed: true } : { seed, randomize_seed: false };
 }
 
 function toDataUrl(b64: string): string {
@@ -47,6 +59,8 @@ async function generateImage(body: QwenGenerateRequest): Promise<QwenResponse> {
           steps: body.steps,
           guidance_scale: body.guidance_scale ?? 7.5,
           lora: body.lora,
+          negative_prompt: body.negative_prompt,
+          ...seedFields(body.seed),
         }),
       }),
       new Promise<never>((_, reject) =>
@@ -69,6 +83,7 @@ async function generateImage(body: QwenGenerateRequest): Promise<QwenResponse> {
     return {
       success: true,
       image: toDataUrl(result.image),
+      seed: result.seed,
       execution_time: Date.now() - startTime,
     };
   } catch (error) {
@@ -94,6 +109,8 @@ async function editImage(body: QwenEditRequest): Promise<QwenResponse> {
           steps: body.steps,
           preserve_identity: body.preserve_identity ?? true,
           lora: body.lora,
+          negative_prompt: body.negative_prompt,
+          ...seedFields(body.seed),
         }),
       }),
       new Promise<never>((_, reject) =>
@@ -116,6 +133,7 @@ async function editImage(body: QwenEditRequest): Promise<QwenResponse> {
     return {
       success: true,
       image: toDataUrl(result.image),
+      seed: result.seed,
       execution_time: Date.now() - startTime,
     };
   } catch (error) {
@@ -150,6 +168,24 @@ export async function POST(request: NextRequest) {
 
     let result: QwenResponse;
 
+    const seed = body.seed === undefined || body.seed === null || body.seed === '' ? undefined : Number(body.seed);
+    if (seed !== undefined && (!Number.isInteger(seed) || seed < 0 || seed > MAX_SEED)) {
+      return NextResponse.json(
+        { error: `Invalid seed. Use an integer between 0 and ${MAX_SEED}.` },
+        { status: 400 }
+      );
+    }
+
+    const negativePrompt =
+      typeof body.negative_prompt === 'string' ? body.negative_prompt.trim() : '';
+    if (negativePrompt.length > MAX_NEGATIVE_PROMPT_LENGTH) {
+      return NextResponse.json(
+        { error: `Negative prompt too long (max ${MAX_NEGATIVE_PROMPT_LENGTH} characters).` },
+        { status: 400 }
+      );
+    }
+    const extra = { lora, seed, negative_prompt: negativePrompt || undefined };
+
     if (mode === 'generate') {
       if (!body.prompt || !body.size || !body.steps) {
         return NextResponse.json(
@@ -157,7 +193,7 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
-      result = await generateImage({ ...body, lora } as QwenGenerateRequest);
+      result = await generateImage({ ...body, ...extra } as QwenGenerateRequest);
     } else {
       if (!body.image || !body.instruction || !body.steps) {
         return NextResponse.json(
@@ -165,7 +201,7 @@ export async function POST(request: NextRequest) {
           { status: 400 }
         );
       }
-      result = await editImage({ ...body, lora } as QwenEditRequest);
+      result = await editImage({ ...body, ...extra } as QwenEditRequest);
     }
 
     // Check for timeout
@@ -186,6 +222,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       image: result.image,
+      seed: result.seed,
       execution_time: result.execution_time,
     });
   } catch (error) {

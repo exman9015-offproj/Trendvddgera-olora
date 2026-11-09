@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Upload, Zap, Image as ImageIcon, ArrowRight } from 'lucide-react';
 import {
   QWEN_IMAGE_SIZES,
@@ -10,6 +10,14 @@ import {
 } from '../config/qwen-api-config';
 
 type QwenMode = 'generate' | 'edit';
+
+interface QwenResult {
+  image: string;
+  seed?: number;
+}
+
+const MAX_IMAGES = 10;
+const MAX_SEED = 2 ** 32 - 1;
 
 interface QwenViewProps {
   onClose?: () => void;
@@ -24,18 +32,151 @@ export default function QwenView({ onClose }: QwenViewProps) {
   const [prompt, setPrompt] = useState('');
   const [selectedSize, setSelectedSize] = useState('512x512');
   const [steps, setSteps] = useState<number>(QWEN_STEP_RANGE.default);
-  const [generatedImage, setGeneratedImage] = useState<string | null>(null);
+  const [generatedImages, setGeneratedImages] = useState<QwenResult[]>([]);
 
   // Edit mode state
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
   const [editInstruction, setEditInstruction] = useState('');
   const [preserveIdentity, setPreserveIdentity] = useState(true);
-  const [editedImage, setEditedImage] = useState<string | null>(null);
+  const [editedImages, setEditedImages] = useState<QwenResult[]>([]);
 
   const [executionTime, setExecutionTime] = useState<number | null>(null);
 
   // Shared by both modes
   const [lora, setLora] = useState<QwenLoraId>('none');
+  const [count, setCount] = useState(1);
+  const [seedInput, setSeedInput] = useState('');
+  const [negativePrompt, setNegativePrompt] = useState('');
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
+  const cancelRef = useRef(false);
+
+  const generationOptions = (
+    <div className="space-y-4">
+      <div>
+        <label className="block text-sm font-semibold text-gray-700 mb-2">
+          Quantidade de imagens: {count}
+        </label>
+        <input
+          type="range"
+          min={1}
+          max={MAX_IMAGES}
+          value={count}
+          onChange={(e) => setCount(Number(e.target.value))}
+          className="w-full"
+          disabled={loading}
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          As imagens aparecem conforme ficam prontas (de 1 a {MAX_IMAGES}).
+        </p>
+      </div>
+      <div>
+        <label
+          htmlFor={`qwen-seed-${mode}`}
+          className="block text-sm font-semibold text-gray-700 mb-2"
+        >
+          Seed (opcional)
+        </label>
+        <input
+          id={`qwen-seed-${mode}`}
+          type="text"
+          inputMode="numeric"
+          value={seedInput}
+          onChange={(e) => setSeedInput(e.target.value.replace(/\D/g, '').slice(0, 10))}
+          placeholder="Vazio = aleatória"
+          className="w-full p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#00A86B]"
+          disabled={loading}
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Com várias imagens, a seed aumenta de 1 em 1 a partir do valor informado.
+        </p>
+      </div>
+      <div>
+        <label
+          htmlFor={`qwen-negative-${mode}`}
+          className="block text-sm font-semibold text-gray-700 mb-2"
+        >
+          Prompt negativo (opcional)
+        </label>
+        <textarea
+          id={`qwen-negative-${mode}`}
+          value={negativePrompt}
+          onChange={(e) => setNegativePrompt(e.target.value)}
+          maxLength={2000}
+          placeholder="Ex: borrado, baixa qualidade, mãos deformadas..."
+          className="w-full h-16 p-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#00A86B] resize-none"
+          disabled={loading}
+        />
+        <p className="text-xs text-gray-500 mt-1">
+          Usar prompt negativo deixa cada imagem mais lenta.
+        </p>
+      </div>
+    </div>
+  );
+
+  // Runs the requests one by one so each image shows up as soon as it is ready
+  const runBatch = async (
+    buildBody: () => Record<string, unknown>,
+    onImage: (result: QwenResult) => void,
+    failureMessage: string
+  ) => {
+    const baseSeed = seedInput === '' ? null : Number(seedInput);
+    if (baseSeed !== null && baseSeed > MAX_SEED) {
+      setError(`Seed deve estar entre 0 e ${MAX_SEED}`);
+      return;
+    }
+
+    cancelRef.current = false;
+    setLoading(true);
+    setError(null);
+    setProgress({ done: 0, total: count });
+
+    try {
+      for (let i = 0; i < count; i++) {
+        if (cancelRef.current) break;
+
+        const body: Record<string, unknown> = {
+          ...buildBody(),
+          lora,
+          negative_prompt: negativePrompt.trim() || undefined,
+        };
+        if (baseSeed !== null) body.seed = (baseSeed + i) % (MAX_SEED + 1);
+
+        const response = await fetch('/api/generate-image-qwen', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await response.json();
+
+        if (!data.success || !response.ok) {
+          setError(
+            `${failureMessage}${count > 1 ? ` (imagem ${i + 1} de ${count})` : ''}: ${
+              data.error || 'erro desconhecido'
+            }`
+          );
+          break;
+        }
+
+        onImage({ image: data.image, seed: data.seed });
+        setExecutionTime(data.execution_time);
+        setProgress({ done: i + 1, total: count });
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Erro desconhecido');
+    } finally {
+      setLoading(false);
+      setProgress(null);
+    }
+  };
+
+  const cancelBatch = () => {
+    cancelRef.current = true;
+  };
+
+  const progressLabel = (verb: string) =>
+    progress && progress.total > 1
+      ? `⏳ ${verb}... ${progress.done}/${progress.total}`
+      : `⏳ ${verb}...`;
 
   const loraSelector = (
     <div>
@@ -73,37 +214,12 @@ export default function QwenView({ onClose }: QwenViewProps) {
       return;
     }
 
-    setLoading(true);
-    setError(null);
-    setGeneratedImage(null);
-
-    try {
-      const response = await fetch('/api/generate-image-qwen', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: 'generate',
-          prompt,
-          size: selectedSize,
-          steps,
-          lora,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!data.success || !response.ok) {
-        setError(data.error || 'Falha ao gerar imagem');
-        return;
-      }
-
-      setGeneratedImage(data.image);
-      setExecutionTime(data.execution_time);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Erro desconhecido');
-    } finally {
-      setLoading(false);
-    }
+    setGeneratedImages([]);
+    await runBatch(
+      () => ({ mode: 'generate', prompt, size: selectedSize, steps }),
+      (result) => setGeneratedImages((prev) => [...prev, result]),
+      'Falha ao gerar imagem'
+    );
   };
 
   // Edit image
@@ -118,38 +234,18 @@ export default function QwenView({ onClose }: QwenViewProps) {
       return;
     }
 
-    setLoading(true);
-    setError(null);
-    setEditedImage(null);
-
-    try {
-      const response = await fetch('/api/generate-image-qwen', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          mode: 'edit',
-          image: uploadedImage,
-          instruction: editInstruction,
-          steps,
-          preserve_identity: preserveIdentity,
-          lora,
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!data.success || !response.ok) {
-        setError(data.error || 'Falha ao editar imagem');
-        return;
-      }
-
-      setEditedImage(data.image);
-      setExecutionTime(data.execution_time);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Erro desconhecido');
-    } finally {
-      setLoading(false);
-    }
+    setEditedImages([]);
+    await runBatch(
+      () => ({
+        mode: 'edit',
+        image: uploadedImage,
+        instruction: editInstruction,
+        steps,
+        preserve_identity: preserveIdentity,
+      }),
+      (result) => setEditedImages((prev) => [...prev, result]),
+      'Falha ao editar imagem'
+    );
   };
 
   // Handle image upload
@@ -258,6 +354,7 @@ export default function QwenView({ onClose }: QwenViewProps) {
           </div>
 
           {loraSelector}
+          {generationOptions}
 
           {/* Steps Slider */}
           <div>
@@ -284,36 +381,54 @@ export default function QwenView({ onClose }: QwenViewProps) {
             disabled={loading || !prompt.trim()}
             className="w-full py-3 bg-[#00A86B] text-white font-bold rounded-lg hover:bg-[#046A4E] disabled:bg-gray-300 transition flex items-center justify-center gap-2"
           >
-            {loading ? '⏳ Gerando...' : '🎨 Gerar Imagem'}
+            {loading ? progressLabel('Gerando') : `🎨 Gerar ${count > 1 ? `${count} Imagens` : 'Imagem'}`}
           </button>
+          {loading && count > 1 && (
+            <button
+              onClick={cancelBatch}
+              className="w-full py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300"
+            >
+              Parar após a imagem atual
+            </button>
+          )}
 
-          {/* Generated Image */}
-          {generatedImage && (
+          {/* Generated Images */}
+          {generatedImages.length > 0 && (
             <div className="mt-6">
-              <img
-                src={generatedImage}
-                alt="Imagem gerada"
-                className="w-full rounded-lg shadow-lg"
-              />
+              <div className={generatedImages.length > 1 ? 'grid grid-cols-2 gap-3' : ''}>
+                {generatedImages.map((item, index) => (
+                  <div key={index}>
+                    <img
+                      src={item.image}
+                      alt={`Imagem gerada ${index + 1}`}
+                      className="w-full rounded-lg shadow-lg"
+                    />
+                    <div className="flex items-center justify-between mt-1 gap-2">
+                      <span className="text-xs text-gray-500">
+                        {item.seed !== undefined && `Seed: ${item.seed}`}
+                      </span>
+                      <button
+                        onClick={() => downloadImage(item.image, `qwen-generated-${index + 1}`)}
+                        className="text-xs px-2 py-1 bg-blue-500 text-white rounded font-semibold hover:bg-blue-600"
+                      >
+                        ⬇️ Baixar
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
               <div className="flex gap-2 mt-3">
                 <button
-                  onClick={() =>
-                    downloadImage(generatedImage, 'qwen-generated')
-                  }
-                  className="flex-1 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600"
-                >
-                  ⬇️ Baixar
-                </button>
-                <button
-                  onClick={() => setGeneratedImage(null)}
-                  className="flex-1 py-2 bg-gray-300 text-gray-700 rounded-lg font-semibold hover:bg-gray-400"
+                  onClick={() => setGeneratedImages([])}
+                  disabled={loading}
+                  className="flex-1 py-2 bg-gray-300 text-gray-700 rounded-lg font-semibold hover:bg-gray-400 disabled:opacity-50"
                 >
                   Limpar
                 </button>
               </div>
               {executionTime && (
                 <p className="text-xs text-gray-500 mt-2">
-                  Tempo: {(executionTime / 1000).toFixed(1)}s
+                  Tempo da última imagem: {(executionTime / 1000).toFixed(1)}s
                 </p>
               )}
             </div>
@@ -387,6 +502,7 @@ export default function QwenView({ onClose }: QwenViewProps) {
           </div>
 
           {loraSelector}
+          {generationOptions}
 
           {/* Steps Slider */}
           <div>
@@ -414,16 +530,24 @@ export default function QwenView({ onClose }: QwenViewProps) {
             className="w-full py-3 bg-[#00A86B] text-white font-bold rounded-lg hover:bg-[#046A4E] disabled:bg-gray-300 transition flex items-center justify-center gap-2"
           >
             {loading ? (
-              '⏳ Editando...'
+              progressLabel('Editando')
             ) : (
               <>
-                ✨ Editar Imagem <ArrowRight className="w-4 h-4" />
+                ✨ Editar {count > 1 ? `${count} Variações` : 'Imagem'} <ArrowRight className="w-4 h-4" />
               </>
             )}
           </button>
+          {loading && count > 1 && (
+            <button
+              onClick={cancelBatch}
+              className="w-full py-2 bg-gray-200 text-gray-700 rounded-lg font-semibold hover:bg-gray-300"
+            >
+              Parar após a imagem atual
+            </button>
+          )}
 
-          {/* Edited Image */}
-          {editedImage && (
+          {/* Edited Images */}
+          {editedImages.length > 0 && (
             <div className="mt-6">
               <div className="grid grid-cols-2 gap-4">
                 <div>
@@ -436,34 +560,38 @@ export default function QwenView({ onClose }: QwenViewProps) {
                     className="w-full rounded-lg shadow"
                   />
                 </div>
-                <div>
-                  <p className="text-xs font-semibold text-gray-500 mb-2">
-                    Editada
-                  </p>
-                  <img
-                    src={editedImage}
-                    alt="Editada"
-                    className="w-full rounded-lg shadow"
-                  />
-                </div>
+                {editedImages.map((item, index) => (
+                  <div key={index}>
+                    <p className="text-xs font-semibold text-gray-500 mb-2">
+                      Editada {editedImages.length > 1 ? index + 1 : ''}
+                      {item.seed !== undefined && ` · Seed: ${item.seed}`}
+                    </p>
+                    <img
+                      src={item.image}
+                      alt={`Editada ${index + 1}`}
+                      className="w-full rounded-lg shadow"
+                    />
+                    <button
+                      onClick={() => downloadImage(item.image, `qwen-edited-${index + 1}`)}
+                      className="mt-1 text-xs px-2 py-1 bg-blue-500 text-white rounded font-semibold hover:bg-blue-600"
+                    >
+                      ⬇️ Baixar
+                    </button>
+                  </div>
+                ))}
               </div>
               <div className="flex gap-2 mt-3">
                 <button
-                  onClick={() => downloadImage(editedImage, 'qwen-edited')}
-                  className="flex-1 py-2 bg-blue-500 text-white rounded-lg font-semibold hover:bg-blue-600"
-                >
-                  ⬇️ Baixar Editada
-                </button>
-                <button
-                  onClick={() => setEditedImage(null)}
-                  className="flex-1 py-2 bg-gray-300 text-gray-700 rounded-lg font-semibold hover:bg-gray-400"
+                  onClick={() => setEditedImages([])}
+                  disabled={loading}
+                  className="flex-1 py-2 bg-gray-300 text-gray-700 rounded-lg font-semibold hover:bg-gray-400 disabled:opacity-50"
                 >
                   Limpar
                 </button>
               </div>
               {executionTime && (
                 <p className="text-xs text-gray-500 mt-2">
-                  Tempo: {(executionTime / 1000).toFixed(1)}s
+                  Tempo da última imagem: {(executionTime / 1000).toFixed(1)}s
                 </p>
               )}
             </div>

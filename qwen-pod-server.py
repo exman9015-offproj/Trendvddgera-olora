@@ -156,6 +156,7 @@ class GenerateRequest(BaseModel):
     seed: Optional[int] = None
     randomize_seed: bool = True
     lora_scale: float = 1.0
+    negative_prompt: Optional[str] = None
     lora: str = LORA_NONE
 
 class EditRequest(BaseModel):
@@ -166,6 +167,7 @@ class EditRequest(BaseModel):
     randomize_seed: bool = True
     lora_scale: float = 1.0
     preserve_identity: bool = True
+    negative_prompt: Optional[str] = None
     lora: str = LORA_NONE
 
 class ImageResponse(BaseModel):
@@ -183,6 +185,12 @@ def _seed(seed: Optional[int], randomize_seed: bool) -> int:
     if randomize_seed or seed is None or seed < 0:
         return random.randint(0, 2**32 - 1)
     return int(seed)
+
+def _negative_kwargs(negative_prompt: Optional[str]) -> dict:
+    """Only pass negative_prompt when given; it enables true CFG (slower)."""
+    if negative_prompt and negative_prompt.strip():
+        return {"negative_prompt": negative_prompt.strip()}
+    return {}
 
 def _activate_lora(lora_id: str, scale: float) -> None:
     """Select the adapter for this request. Caller must hold pipe_lock."""
@@ -278,6 +286,7 @@ def generate(req: GenerateRequest):
             _activate_lora(req.lora, req.lora_scale)
             image = pipe(
                 prompt=req.prompt.strip(),
+                **_negative_kwargs(req.negative_prompt),
                 width=width,
                 height=height,
                 num_inference_steps=int(req.steps),
@@ -352,6 +361,7 @@ def edit(req: EditRequest):
             _activate_lora(req.lora, req.lora_scale)
             output = pipe(
                 prompt=req.instruction.strip(),
+                **_negative_kwargs(req.negative_prompt),
                 image=input_image,
                 width=width,
                 height=height,
